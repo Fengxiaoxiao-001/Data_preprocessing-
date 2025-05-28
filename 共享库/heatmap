@@ -1,0 +1,251 @@
+# 热力图
+import seaborn as sns
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+import dask.dataframe as dd
+from typing import Optional, Union
+
+class HeatmapGenerator:
+    def __init__(self,
+                 data: Union[pd.DataFrame, dd.DataFrame,list, dict],
+                 title: str = "Heatmap",
+                 color_map: str = "coolwarm",
+                 annot: bool = True,
+                 fmt: str = ".2f",
+                 vmin: Optional[float] = None,
+                 vmax: Optional[float] = None):
+        """
+        热力图生成器核心类
+        :param data: 支持Dask/Pandas DataFrame/list/dict输入
+        :param title: 标题(默认"Heatmap")
+        :param color_map: 颜色映射方案(参考网页7推荐配色)
+        :param annot: 是否显示数值标注
+        :param fmt: 数值格式(如".2f"或"d")
+        :param vmin/vmax: 颜色标准化范围(参考网页6最佳实践)
+        """
+        self.data = self._preprocess_data(data)
+        self.title = title
+        self.cmap = self._get_preset_cmap(color_map)
+        self.annot = annot
+        self.fmt = fmt
+        self.vmin, self.vmax = self._calc_quantile_range() if vmin is None else (vmin, vmax)
+        self.figsize = (10, 8)
+        self.ax = None
+        self._reorder_index = None
+        self._init_style()
+
+    def _preprocess_data(self, raw_data) -> pd.DataFrame:
+        """支持Dask DataFrame转换"""
+        if isinstance(raw_data, dd.DataFrame):
+            return raw_data.compute()
+        elif isinstance(raw_data, pd.DataFrame):
+            return raw_data
+        elif isinstance(raw_data, (dict, list)):
+            return pd.DataFrame(raw_data)
+        else:
+            raise TypeError("支持数据类型: Dask/Pandas DataFrame/list/dict")
+
+    def _init_style(self):
+        """初始化Seaborn主题(标准化设置)"""
+        sns.set_theme(style="whitegrid", palette="pastel")
+        plt.rcParams['font.sans-serif'] = ['SimHei']  # 支持中文
+        plt.rcParams['axes.unicode_minus'] = False
+
+    def _calc_quantile_range(self):
+        """基于分位数动态设置颜色范围)"""
+        q05 = self.data.quantile(0.05)
+        q95 = self.data.quantile(0.95)
+        return (q05.min(), q95.max())
+
+    def _get_preset_cmap(self, name: str):
+        """预置专业配色方案[5,7]"""
+        cmap_presets = {
+            'viridis': sns.color_palette("viridis", as_cmap=True),
+            'icefire': sns.diverging_palette(220, 20, as_cmap=True),
+            'coolwarm': sns.color_palette("coolwarm", as_cmap=True)
+        }
+        return cmap_presets.get(name, name)
+
+    def add_outlier_layer(self, outlier_mask: pd.DataFrame):
+        """更健壮的异常值染色层添加"""
+        # 确保掩码与热力图数据维度匹配
+        if outlier_mask.shape != self.data.shape:
+            # 尝试重新索引对齐
+            outlier_mask = outlier_mask.reindex(
+                index=self.data.index,
+                columns=self.data.columns,
+                fill_value=False
+            )
+
+        self.outlier_mask = outlier_mask.astype(bool)
+        return self
+
+    def add_clustering(self, method: str = 'ward', metric: str = 'euclidean'):
+        """增强版层次聚类)"""
+        g = sns.clustermap(
+            self.data,
+            cmap=self.cmap,
+            method=method,
+            metric=metric,
+            figsize=self.figsize
+        )
+        self.data = g.data2d  # 更新排序后的数据
+        self._reorder_index = g.dendrogram_row.reordered_ind
+        return self
+
+    def set_figure_size(self, width: int, height: int):
+        """设置画布尺寸"""
+        self.figsize = (width, height)
+        return self  # 支持链式调用
+
+    def draw(self) -> plt.Axes:
+        """集成异常值染色层的绘制方法"""
+        plt.figure(figsize=self.figsize)
+
+        # 主热力图
+        self.ax = sns.heatmap(
+            self.data,
+            annot=self.annot,
+            fmt=self.fmt,
+            cmap=self.cmap,
+            vmin=self.vmin,
+            vmax=self.vmax,
+            linewidths=0.5,
+            cbar_kws={"shrink": 0.75}
+        )
+
+        # 叠加异常值染色层（通过add_outlier_layer预加载）
+        if hasattr(self, 'outlier_mask') and self.outlier_mask is not None:
+            # 创建红色半透明覆盖层
+            overlay = np.zeros((*self.data.shape, 4))  # RGBA数组
+            overlay[self.outlier_mask] = [1, 0, 0, 0.3]  # 红色半透明
+
+            self.ax.imshow(
+                overlay,
+                aspect=self.ax.get_aspect(),
+                extent=self.ax.get_xlim() + self.ax.get_ylim(),
+                zorder=2  # 确保在热力图上方
+            )
+
+        self.ax.set_title(self.title, fontsize=14, pad=20)
+        return self.ax
+
+    def stream_draw(self, chunk_size: int = 1e5):
+        """大数据流式渲染"""
+        total_len = len(self.data)
+        for i in range(0, total_len, chunk_size):
+            chunk = self.data.iloc[i:i + chunk_size]
+            self._draw_chunk(chunk)
+            plt.pause(0.1)
+            plt.clf()
+
+    def _draw_chunk(self, data_chunk: pd.DataFrame):
+        """子块绘制方法"""
+        sns.heatmap(data_chunk, cmap=self.cmap, cbar=False)
+        plt.title(f"Streaming: {len(data_chunk)} Samples")
+        plt.draw()
+
+    def update_data(self, cleaned_data):
+        """更新清洗后的数据"""
+        self.data = self._preprocess_data(cleaned_data)
+        return self
+
+    def save(self, filename: str, dpi: int = 300):
+        """保存高清图片"""
+        plt.savefig(filename, bbox_inches='tight', dpi=dpi)
+        plt.close()
+
+    def show(self):
+        """即时显示图表"""
+        plt.show()
+        plt.close()
+
+# 使用示例
+# (独立处理)
+'''
+# 创建学生成绩数据（参考网页8学生成绩案例）
+score_data = {
+    "数学": [88, 72, 95, 60, 82],
+    "英语": [92, 68, 85, 65, 76],
+    "物理": [78, np.nan, 90, 55, 88]  # 包含缺失值
+}
+students = ["张三", "李四", "王五", "赵六", "陈七"]
+
+# 实例化热力图生成器（应用网页7推荐配色）
+hg = (
+    HeatmapGenerator(
+        pd.DataFrame(score_data, index=students).fillna(75),  # 缺失值填充
+        title="学生成绩分布热力图",
+        color_map="icefire",       # 高对比度配色
+        annot=True,                # 显示数值标注
+        fmt="d"                    # 整数格式
+    )
+    .add_clustering(metric='correlation')  # 按相关性聚类[7](@ref)
+    .set_figure_size(12, 6)        # 优化画布尺寸[5](@ref)
+    .set_color_range(60, 95)       # 手动设置颜色范围[6](@ref)
+)
+
+# 叠加模拟异常值（数学成绩>90为异常）
+outlier_mask = pd.DataFrame({
+    "数学": [False, False, True, False, False],
+    "英语": [False, False, False, False, False],
+    "物理": [False, False, False, False, False]
+})
+hg.add_outlier_layer(outlier_mask)  # 异常值染色[7](@ref)
+
+hg.draw().save("student_scores.png", dpi=300)
+'''
+# （适配Outlier）
+'''
+class EnhancedDataAnalyzer:
+    """增强版数据分析管道"""
+    
+    def __init__(self, settings: OutlierSetting):
+        self.manager = DataManager(settings)
+        self.manager.load_data()
+        self.outlier_mask = None
+
+    def detect_outliers(self, method: str = 'iqr'):
+        """异常检测与处理流程"""
+        # 数据预处理（参考网页8风电数据处理）
+        self.manager.ddf = self.manager.ddf.fillna(self.manager.ddf.mean())
+        
+        # 异常检测（应用网页5 Hampel滤波思想）
+        outlier_handler = HandlingOutlier(self.manager)
+        outlier_handler.process(method=method)
+        
+        # 生成异常掩膜（用于热力图染色）
+        original_data = self.manager.ddf.compute()
+        cleaned_data = outlier_handler.get_clean_data().compute()
+        self.outlier_mask = (original_data != cleaned_data).reindex_like(original_data)
+        
+    def generate_analysis_report(self):
+        """生成综合可视化报告"""
+        # 相关性热力图（应用网页1基因表达矩阵思想）
+        HeatmapGenerator(
+            self.manager.ddf.corr().compute(),  # 计算清洗后数据的相关性
+            title="清洗后数据相关性热力图",
+            color_map="viridis",     # 科研级配色[7](@ref)
+            annot=False              # 大数据关闭标注[6](@ref)
+        ).add_clustering().save("cleaned_corr.png")
+        
+        # 原始数据异常分布热力图（结合网页7染色技术）
+        HeatmapGenerator(
+            self.manager.ddf.compute(),
+            vmin=self.manager.ddf.quantile(0.05).min().compute(),  # 动态分位数范围[5](@ref)
+            vmax=self.manager.ddf.quantile(0.95).max().compute()
+        ).add_outlier_layer(self.outlier_mask).save("outlier_distribution.png")
+
+# 使用示例
+settings = OutlierSetting(
+    path='financial_data.parquet',
+    blocksize='512MB',
+    na_value=['null'],
+    dtype={'revenue': 'float32', 'cost': 'float32'}
+)
+
+analyzer = EnhancedDataAnalyzer(settings)
+analyzer.detect_outliers(method='isolation_forest')  # 使用孤立森林检测
+analyzer.generate_analysis_report()
+'''
